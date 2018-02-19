@@ -1,0 +1,30 @@
+---
+iam_password_policy_state: present
+min_pw_length: 8                        # CIS1.9
+require_symbols: false                  # CIS1.7
+require_numbers: true                   # CIS1.8
+require_uppercase: true                 # CIS1.5
+require_lowercase: true                 # CIS1.6
+allow_pw_change: true
+pw_max_age: 60
+pw_reuse_prevent: 5
+pw_expire: false
+
+iam_groups:
+  - name: 'test_group'
+    state: 'present'
+  - name: 'test_group2'
+    state: 'present'
+
+iam_users:
+  - name: 'joe'
+    state: 'present'
+    password: '1q2w3e4r5t'
+    groups:
+      - 'test_group'
+  - name: 'dan'
+    state: 'present'
+    password: '1q2w3e4r5t121213'
+    groups:
+      - 'test_group2'
+...

@@ -1,0 +1,769 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Establishes a baseline set of security controls
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: CloudWatch Rules and Alarms
+        Parameters:
+          - NotificationEmailAddressForCloudWatchAlarms
+
+    ParameterLabels:
+      NotificationEmailAddressForCloudWatchAlarms:
+        default: Notification Address
+
+Parameters:
+  NotificationEmailAddressForCloudWatchAlarms:
+    Type: String
+    Default: ""
+  UnauthorizedApiCalls:
+    Type: String
+    Default: "disabled"
+  RootUsage:
+    Type: String
+    Default: "disabled"
+  NoConsoleMfa:
+    Type: String
+    Default: "disabled"
+  ConsoleAuthFailures:
+    Type: String
+    Default: "disabled"
+  CustomerCmk:
+    Type: String
+    Default: "disabled"
+  S3BucketChanges:
+    Type: String
+    Default: "disabled"
+  ConfigConfigChanges:
+    Type: String
+    Default: "disabled"
+  KmsKeyUse:
+    Type: String
+    Default: "disabled"
+  CloudtrailChanges:
+    Type: String
+    Default: "disabled"
+  IamChanges:
+    Type: String
+    Default: "disabled"
+  BillingChanges:
+    Type: String
+    Default: "disabled"
+  Ec2TermChanges:
+    Type: String
+    Default: "disabled"
+  SecurityGroupChanges:
+    Type: String
+    Default: "disabled"
+  NaclChanges:
+    Type: String
+    Default: "disabled"
+  NetworkChanges:
+    Type: String
+    Default: "disabled"
+
+Conditions:
+  UnauthorizedApiCallsBool: !Equals [ !Ref UnauthorizedApiCalls, 'enabled' ]
+  RootUsageBool: !Equals [ !Ref RootUsage, 'enabled' ]
+  NoConsoleMfaBool: !Equals [ !Ref NoConsoleMfa, 'enabled' ]
+  ConsoleAuthFailuresBool: !Equals [ !Ref ConsoleAuthFailures, 'enabled' ]
+  CustomerCmkBool: !Equals [ !Ref CustomerCmk, 'enabled' ]
+  S3BucketChangesBool: !Equals [ !Ref S3BucketChanges, 'enabled' ]
+  ConfigConfigChangesBool: !Equals [ !Ref ConfigConfigChanges, 'enabled' ]
+  KmsKeyUseBool: !Equals [ !Ref KmsKeyUse, 'enabled' ]
+  CloudtrailChangesBool: !Equals [ !Ref CloudtrailChanges, 'enabled' ]
+  IamChangesBool: !Equals [ !Ref IamChanges, 'enabled' ]
+  BillingChangesBool: !Equals [ !Ref BillingChanges, 'enabled' ]
+  Ec2TermChangesBool: !Equals [ !Ref Ec2TermChanges, 'enabled' ]
+  SecurityGroupChangesBool: !Equals [ !Ref SecurityGroupChanges, 'enabled' ]
+  NaclChangesBool: !Equals [ !Ref NaclChanges, 'enabled' ]
+  NetworkChangesBool: !Equals [ !Ref NetworkChanges, 'enabled' ]
+
+Resources:
+  MasterConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSCloudTrailReadOnlyAccess
+        - arn:aws:iam::aws:policy/IAMReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        -
+          PolicyName: KmsReadOnly
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - kms:GetKeyRotationStatus
+                  - kms:ListKeys
+                Resource: "*"
+
+        -
+          PolicyName: S3ReadOnly
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLogging
+                Resource: "*"
+
+#==================================================
+# CloudWatch Logs Metrics and Alarms
+#==================================================
+
+  SnsTopicForCloudWatchEvents:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CloudWatchNotifications
+      DisplayName: Broadcasts formatted CloudWatch events to subscribers
+      Subscription:
+        -
+          Endpoint: !Ref NotificationEmailAddressForCloudWatchAlarms
+          Protocol: email
+
+  #==================================================
+  # Resources for GetCloudTrailCloudWatchLog
+  #==================================================
+  GetCloudTrailCloudWatchLog:
+    Type: AWS::Lambda::Function
+    DependsOn: MasterConfigRole
+    Properties:
+      FunctionName: GetCloudTrailCloudWatchLog
+      Code:
+        ZipFile: |
+          #==================================================================================================
+          # Function: GetCloudTrailCloudWatchLog
+          # Purpose:  Returns the CloudWatch Log that is used by CloudTrail
+          #==================================================================================================
+
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+
+              cloudwatch_log = ''
+              response_data = {}
+
+              if event['RequestType'] == 'Create':
+
+                for trail in boto3.client('cloudtrail').describe_trails(includeShadowTrails=False)['trailList']:
+                  if 'CloudWatchLogsLogGroupArn' in trail:
+                    cloudwatch_log = trail['CloudWatchLogsLogGroupArn'].split(':')[6]
+                    break
+
+              response_data['LogName'] = cloudwatch_log
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, '')
+
+      Description: Returns the CloudWatch Log that is used by CloudTrail
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt MasterConfigRole.Arn
+      Runtime: python2.7
+      Timeout: 5
+
+  ResourceForGetCloudTrailCloudWatchLog:
+    Type: Custom::ResourceForGetCloudTrailCloudWatchLog
+    DependsOn: GetCloudTrailCloudWatchLog
+    Properties:
+      ServiceToken: !GetAtt GetCloudTrailCloudWatchLog.Arn
+
+  #==================================================
+  # CIS 3.1	Ensure a log metric filter and alarm exist for unauthorized API calls
+  #==================================================
+  UnauthorizedAttemptsCloudWatchFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: UnauthorizedApiCallsBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{ ($.errorCode = \"*UnauthorizedOperation\") || ($.errorCode = \"AccessDenied*\") }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: UnauthorizedAttemptCount
+          MetricValue: 1
+
+  UnauthorizedAttemptCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UnauthorizedApiCallsBool
+    Properties:
+      AlarmName: Unauthorized Activity Attempt
+      AlarmDescription: Multiple unauthorized actions or logins attempted
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: UnauthorizedAttemptCount
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 5
+      TreatMissingData: notBreaching
+
+  #==================================================
+  # CIS 1.1 Avoid the use of the "root" account
+  # CIS 3.3 Ensure a log metric filter and alarm exist for usage of "root" account
+  #==================================================
+  IAMRootActivityCloudWatchMetric:
+    Type: AWS::Logs::MetricFilter
+    Condition: RootUsageBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{
+          $.userIdentity.type = \"Root\" &&
+          $.userIdentity.invokedBy NOT EXISTS &&
+          $.eventType != \"AwsServiceEvent\"
+          }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: RootUserEventCount
+          MetricValue: 1
+
+  IAMRootActivityCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: RootUsageBool
+    Properties:
+      AlarmName: IAM Root Activity
+      AlarmDescription: Root user activity detected
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: RootUserEventCount
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  #==================================================
+  # CIS 3.2	Ensure a log metric filter and alarm exist for Management Console sign-in without MFA
+  #==================================================
+  ConsoleSigninWithoutMfaCloudWatchMetric:
+    Type: AWS::Logs::MetricFilter
+    Condition: NoConsoleMfaBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{
+          ($.eventName = \"ConsoleLogin\") &&
+          ($.additionalEventData.MFAUsed != \"Yes\") &&
+          ($.responseElements.ConsoleLogin != \"Failure\") &&
+          ($.additionalEventData.SamlProviderArn NOT EXISTS)
+          }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: ConsoleSigninWithoutMFA
+          MetricValue: 1
+
+  ConsoleSigninWithoutMFACloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: NoConsoleMfaBool
+    Properties:
+      AlarmName: Console Signin Without MFA
+      AlarmDescription: Console signin without MFA
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: ConsoleSigninWithoutMFA
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  #==================================================
+  # CIS 3.6	Ensure a log metric filter and alarm exist for AWS Management Console authentication failures
+  #==================================================
+  ConsoleLoginFailureCloudWatchMetric:
+    Type: AWS::Logs::MetricFilter
+    Condition: ConsoleAuthFailuresBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{
+          ($.eventName = \"ConsoleLogin\") &&
+          ($.errorMessage = \"Failed authentication\")
+          }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: ConsoleLoginFailures
+          MetricValue: 1
+
+  ConsoleLoginFailureCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ConsoleAuthFailuresBool
+    Properties:
+      AlarmName: Console Login Failures
+      AlarmDescription: Console login failures over a five-minute period
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: ConsoleLoginFailures
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  #==================================================
+  # 3.7	Ensure a log metric filter and alarm exist for disabling or scheduled deletion of customer created CMKs
+  #==================================================
+  KMSCustomerKeyDeletionCloudWatchMetric:
+    Type: AWS::Logs::MetricFilter
+    Condition: CustomerCmkBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{
+          ($.eventSource = kms.amazonaws.com) &&
+          (($.eventName=DisableKey)||($.eventName=ScheduleKeyDeletion))
+          }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: KMSCustomerKeyDeletion
+          MetricValue: 1
+
+  KMSCustomerKeyDeletionCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CustomerCmkBool
+    Properties:
+      AlarmName: KMS Key Disabled or Scheduled for Deletion
+      AlarmDescription: Disabling or scheduled deletion of customer-managed KMS keys
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: KMSCustomerKeyDeletion
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+#==================================================
+# CloudWatch Event Rules
+#==================================================
+  RoleForCloudWatchEvents:
+    Type: AWS::IAM::Role
+    DependsOn: SnsTopicForCloudWatchEvents
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        -
+          PolicyName: AllowSnsPublish
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SnsTopicForCloudWatchEvents
+
+  FunctionToFormatCloudWatchEvent:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - RoleForCloudWatchEvents
+      - SnsTopicForCloudWatchEvents
+    Properties:
+      FunctionName: FormatCloudWatchEvent
+      Code:
+        ZipFile: !Sub |
+          #==================================================================================================
+          # Function: process-cloudwatch-event
+          # Purpose:  Processes CloudWatch Event before publishing to SNS.
+          #==================================================================================================
+
+          import boto3
+          import json
+
+          SNS_TOPIC_ARN = '${SnsTopicForCloudWatchEvents}'
+
+          #==================================================================================================
+          # Function handler
+          #==================================================================================================
+          def lambda_handler(event, context):
+
+              response = boto3.client('sns').publish(
+                  TopicArn = SNS_TOPIC_ARN,
+                  Message = json.dumps(event, indent=4),
+                  Subject = 'NOTIFICATION {0}:{1}'.format(event['detail']['eventSource'], event['detail']['eventName']),
+                  MessageStructure = 'raw'
+              )
+
+      Description: Formats a given CloudWatch Event to be published to an SNS topic
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt RoleForCloudWatchEvents.Arn
+      Runtime: python2.7
+      Timeout: 5
+
+  LambdaPermissionForCloudTrailCloudWatchEventRules:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - FunctionToFormatCloudWatchEvent
+    Properties:
+      FunctionName: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  #==================================================
+  # CIS 3.8	Ensure a log metric filter and alarm exist for S3 bucket policy changes
+  #==================================================
+  DetectS3BucketPolicyChanges:
+    Type: AWS::Events::Rule
+    Condition: S3BucketChangesBool
+    Properties:
+      Name: DetectS3BucketPolicyChanges
+      Description: Publishes formatted S3 bucket policy change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutBucketAcl
+            - PutBucketPolicy
+            - PutBucketCors
+            - PutBucketLifecycle
+            - PutBucketReplication
+            - DeleteBucketPolicy
+            - DeleteBucketCors
+            - DeleteBucketLifecycle
+            - DeleteBucketReplication
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.9	Ensure a log metric filter and alarm exist for AWS Config configuration changes
+  #==================================================
+  DetectConfigChanges:
+    Type: AWS::Events::Rule
+    Condition: ConfigConfigChangesBool
+    Properties:
+      Name: DetectConfigChanges
+      Description: Publishes formatted Config change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - config.amazonaws.com
+          eventName:
+            - PutConfigurationRecorder
+            - StopConfigurationRecorder
+            - DeleteDeliveryChannel
+            - PutDeliveryChannel
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # KMS Key Use Detection
+  #==================================================
+  KmsKeyUseCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: KmsKeyUseBool
+    Properties:
+      Name: DetectKmsKeyUsage
+      Description: Publishes formatted KMS encryption events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource: [kms.amazonaws.com]
+          eventName:
+            - Decrypt
+            - Encrypt
+      State: DISABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.5	Ensure a log metric filter and alarm exist for CloudTrail configuration changes
+  #==================================================
+  CloudTrailCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: CloudtrailChangesBool
+    Properties:
+      Name: DetectCloudTrailChanges
+      Description: Publishes formatted CloudTrail change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource: [cloudtrail.amazonaws.com]
+          eventName:
+            - StopLogging
+            - DeleteTrail
+            - UpdateTrail
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.4	Ensure a log metric filter and alarm exist for IAM policy changes
+  #==================================================
+  IamPolicyChangesCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: IamChangesBool
+    Properties:
+      Name: DetectIamPolicyChanges
+      Description: Publishes formatted IAM policy change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateAccessKey
+            - DeleteAccessKey
+            - DeleteRolePolicy
+            - DeleteUserPolicy
+            - PutGroupPolicy
+            - PutRolePolicy
+            - PutUserPolicy
+            - CreatePolicy
+            - DeletePolicy
+            - CreatePolicyVersion
+            - DeletePolicyVersion
+            - AttachRolePolicy
+            - DetachRolePolicy
+            - AttachUserPolicy
+            - DetachUserPolicy
+            - AttachGroupPolicy
+            - DetachGroupPolicy
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # Billing Change Detection
+  #==================================================
+  BillingChangeCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: BillingChangesBool
+    Properties:
+      Name: DetectBillingChangeEvents
+      Description: Publishes formatted billing change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - aws-portal.amazonaws.com
+          eventName:
+            - ModifyAccount
+            - ModifyBilling
+            - ModifyPaymentMethods
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # EC2 Termination Detection
+  #==================================================
+  Ec2TerminationCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: Ec2TermChangesBool
+    Properties:
+      Name: DetectEc2TerminationEvents
+      Description: Publishes formatted EC2 termination events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - TerminateInstances
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.10	Ensure a log metric filter and alarm exist for security group changes
+  #==================================================
+  SecurityGroupChangesCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: SecurityGroupChangesBool
+    Properties:
+      Name: DetectSecurityGroupChanges
+      Description: Publishes formatted security group change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - RevokeSecurityGroupEgress
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.11	Ensure a log metric filter and alarm exist for changes to Network Access Control Lists (NACL)
+  #==================================================
+  NetworkAclChangesCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: NaclChangesBool
+    Properties:
+      Name: DetectNetworkAclChanges
+      Description: Publishes formatted network ACL change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - CreateNetworkAcl
+            - CreateNetworkAclEntry
+            - DeleteNetworkAcl
+            - DeleteNetworkAclEntry
+            - ReplaceNetworkAclEntry
+            - ReplaceNetworkAclAssociation
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  #==================================================
+  # CIS 3.12	Ensure a log metric filter and alarm exist for changes to network gateways
+  # CIS 3.13	Ensure a log metric filter and alarm exist for route table changes
+  # CIS 3.14	Ensure a log metric filter and alarm exist for VPC changes
+  # CIS 3.15	Ensure appropriate subscribers to each SNS topic
+  #==================================================
+  NetworkChangeCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Condition: NetworkChangesBool
+    Properties:
+      Name: DetectNetworkChangeEvents
+      Description: Publishes formatted network change events to an SNS topic
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AttachInternetGateway
+            - AssociateRouteTable
+            - CreateCustomerGateway
+            - CreateInternetGateway
+            - CreateRoute
+            - CreateRouteTable
+            - DeleteCustomerGateway
+            - DeleteInternetGateway
+            - DeleteRoute
+            - DeleteRouteTable
+            - DeleteDhcpOptions
+            - DetachInternetGateway
+            - DisassociateRouteTable
+            - ReplaceRoute
+            - ReplaceRouteTableAssociation
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt FunctionToFormatCloudWatchEvent.Arn
+          Id: TargetFunctionV1
+
+  BillingChangesCloudWatchFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: BillingChangesBool
+    DependsOn:
+      - ResourceForGetCloudTrailCloudWatchLog
+    Properties:
+      LogGroupName: !GetAtt ResourceForGetCloudTrailCloudWatchLog.LogName
+      FilterPattern: "{
+          ($.eventName = ModifyAccount) ||
+          ($.eventName = ModifyBilling) ||
+          ($.eventName = ModifyPaymentMethods)
+          }"
+      MetricTransformations:
+        -
+          MetricNamespace: CloudTrailMetrics
+          MetricName: BillingEventCount
+          MetricValue: 1
+
+  BillingChangesCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BillingChangesBool
+    Properties:
+      AlarmName: Billing Changes
+      AlarmDescription: Alarms when changes are made to billing properties
+      AlarmActions:
+        - !Ref SnsTopicForCloudWatchEvents
+      MetricName: BillingEventCount
+      Namespace: CloudTrailMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching

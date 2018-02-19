@@ -1,0 +1,22 @@
+---
+cloudtrail_buckets:
+  - name: 'avyantestbucket'
+    mode: 'create'
+    permission: 'private'
+
+cloudtrail_s3_logging:
+  - name: 'avyantestbucket-logging'
+    state: 'present'
+    target_bucket: 'avyantestbucket'
+    target_prefix: 'logs/cloudtrail'
+
+cloudtrail_trails:
+  - name: 'test_trail'
+    state: 'present'
+    enable_logging: true
+    multi_region: true
+    bucket: 'avyantestbucket'
+    keyprefix: 'logs/cloudtrail'
+    log_validation: true
+    kms_key_id: ''
+...

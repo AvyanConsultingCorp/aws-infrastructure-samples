@@ -1,0 +1,129 @@
+---
+- name: Provision CIS Testing Resources
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - cis_vars/iam.yaml
+    - cis_vars/logging.yaml
+    - cis_vars/monitoring.yaml
+    - cis_vars/networking.yaml
+
+  tasks:
+    - name: IAM Password Policy
+      iam_password_policy:
+        state: "{{ iam_password_policy_state }}"
+        min_pw_length: "{{ min_pw_length }}"
+        require_symbols: "{{ require_symbols }}"
+        require_numbers: "{{ require_numbers }}"
+        require_uppercase: "{{ require_uppercase }}"
+        require_lowercase: "{{ require_lowercase }}"
+        allow_pw_change: "{{ allow_pw_change }}"
+        pw_max_age: "{{ pw_max_age }}"
+        pw_reuse_prevent: "{{ pw_reuse_prevent }}"
+        pw_expire: "{{ pw_expire }}"
+      tags: iam
+
+    - name: IAM User Groups
+      iam:
+        iam_type: group
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+      with_items: "{{ iam_groups }}"
+      tags: iam
+
+    - name: IAM Users
+      iam:
+        iam_type: user
+        name: "{{ item.name }}"
+        groups: "{{ item.groups }}"
+        state: "{{ item.state }}"
+        password: "{{ item.password }}"
+        access_key_state: create
+      with_items: "{{ iam_users }}"
+      tags: iam
+
+    - name: CloudTrail S3 Buckets
+      s3:
+        bucket: "{{ item.name }}"
+        mode: "{{ item.mode }}"
+        permission: "{{ item.permission }}"
+      with_items: "{{ cloudtrail_buckets }}"
+      tags: logging
+
+    - name: CloudTrail S3 Bucket Logging
+      s3_logging:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+        target_bucket: "{{ item.bucket }}"
+        target_prefix: "{{ item.prefix }}"
+      with_items: "{{ cloudtrail_s3_logging }}"
+      tags: logging
+
+    - name: Cloudtrail Logging
+      cloudtrail:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+        enable_logging: "{{ enable_logging }}"
+        is_multi_region_trail: "{{ item.multi_region }}"
+        s3_bucket_name: "{{ item.bucket }}"
+        s3_key_prefix: "{{ item.keyprefix }}"
+        enable_log_file_validation: "{{ item.log_validation }}"
+        kms_key_id: "{{ item.kms_key_id }}"
+      with_items: "{{ cloudtrail_trails }}"
+      tags: logging
+
+    - name: Monitoring Filters & Alarms
+      cloudformation:
+        stack_name:  "{{ item.name }}-Monitoring-Stack"
+        state: "{{  }}"
+        template: "../cfn_templates/monitoring.yaml"
+        template_parameters:
+          NotificationEmailAddressForCloudWatchAlarms: "{{ item.name }}"
+          ExistingVpc: "{{ item.existing_vpc | default('') }}"
+          VpcNetblock: "{{ item.vpc_net }}"
+          DmzCidr: "{{ item.dmz_net }}"
+          LanCidr: "{{ item.lan_net }}"
+      tags: monitoring
+
+    - name: Networking IAM role for flow logs
+      iam:
+        iam_type: role
+        name: VpcFlowLogs
+        state: present
+        trust_policy:
+          Version: '2012-10-17'
+          Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+      register: flowlog_role
+
+    - name: Networking VPC
+      ec2_vpc_net:
+        name: "{{ item.name }}"
+        state: "{{ item.state }}"
+        cidr_block: "{{ item.cidr }}"
+      with_items: "{{ vpcs }}"
+      register: vpc_facts
+      tags: networking
+
+    - name: Networking VPC Flow Logs
+      shell: >
+        aws ec2 create-flow-logs --resource-type VPC --resource-ids {{ item.vpc_id }} \
+        --traffic-type ALL --log-group-name /aws/flowlogs/{{ item.vpc_id }} \
+        --deliver-logs-permission-arn {{ flowlog_role.arn }}
+      with_items: "{{ vpc_facts.results }}"
+      when: enable_vpc_flow_logs == 'enabled'
+      tags: networking
+
+    - name: Networking Security Groups
+      ec2_group:
+        name: "{{ item.name }}"
+        description: an example EC2 group
+        vpc_id: "{{ vpc_facts.0.id }}"
+        rules: "{{ item.ingress_rules }}"
+        rules_egress: "{{ item.egress_rules }}"
+      with_items: "{{ vpc_security_groups }}"
+      tags: networking

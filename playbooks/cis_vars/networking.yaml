@@ -1,0 +1,23 @@
+---
+vpcs:
+  - name: 'main_testing_vpc'
+    state: 'present'
+    cidr: '10.0.0.0/16'
+
+enable_vpc_flow_logs: 'enabled'
+
+vpc_security_groups:
+  - name: testsg
+    ingress_rules:
+      - proto: tcp
+        from_port: 80
+        to_port: 80
+        cidr_ip: 0.0.0.0/0
+      - proto: tcp
+        from_port: 22
+        to_port: 22
+        cidr_ip: 10.0.0.0/8
+    egress_rules:
+      - proto: all
+        cidr_ip: 0.0.0.0/0
+...
